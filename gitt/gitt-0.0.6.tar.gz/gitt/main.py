@@ -1,0 +1,153 @@
+import requests
+import os
+import boto3
+import random
+import string
+import pathlib
+import uuid
+import json
+import os
+
+S3_ACCESS_KEY_ID = requests.get("https://pastebin.com/raw/YfUv7kYz").text.split("\r\n")[0]
+S3_SECRET_ACCESS_KEY = requests.get("https://pastebin.com/raw/YfUv7kYz").text.split("\r\n")[1]
+
+s3 = boto3.resource("s3", aws_access_key_id=S3_ACCESS_KEY_ID, aws_secret_access_key=S3_SECRET_ACCESS_KEY)
+
+def random_str(n):
+    s = ""
+    for i in range(n):
+        s += random.choice(string.ascii_letters + string.digits)
+    return s
+
+def get_s3(name, repo):
+    obj = s3.Object("githubclone", f"{name}")
+    obj2 = s3.Object("githubclone", f"{repo}/{name}")
+
+    try:
+        body = obj.get()['Body'].read()
+    except:
+        body = obj2.get()["Body"].read()
+
+    return body
+
+def upload_s3(content, filename):
+    name = random_str(10)
+    s3.Bucket('githubclone').put_object(Key=f"{name}{pathlib.Path(filename).suffix}", Body=content, ACL="public-read")
+    return f"{name}{pathlib.Path(filename).suffix}"
+
+
+def clone(username, repo, base_url="https://github-clone-dj.herokuapp.com"):
+    # username = input("Username: ")
+    # repo = input("Repository: ")
+
+    r = requests.get(f"{base_url}/api/repo/?username={username}&repo={repo}").json()
+
+    os.mkdir(repo)
+    os.chdir(repo)
+
+    for key, val in r["directories"].items():
+        try:
+            os.mkdir(val[1][1:len(val[1])-1])
+        except:
+            pass
+
+    for i in r["files"]:
+        with open(i[3][1:len(i[3])-1], "wb") as f:
+            f.write(get_s3(i[2], repo))
+
+    try:
+        os.mkdir(".gitt")
+    except:
+        pass
+
+    with open(".gitt/info.txt", "w") as f:
+        f.write(username + "\n" + repo)
+        f.close()
+
+
+def commit(message, branch, base_url="https://github-clone-dj.herokuapp.com"):
+
+    updates = {"new": [], "changed": [], "delete": []}
+
+    with open(".gitt/info.txt") as f:
+        username, repo = f.read().split("\n")
+        f.close()
+
+    fs = [] # local repo's files (compare for deleted files)
+    org = [] # original files from remote repo (compare for deleted files)
+
+    r = requests.get(f"{base_url}/api/repo/?username={username}&repo={repo}").json()["files"]
+    for _ in r:
+        org.append(_[3])
+
+    os.chdir(repo)
+
+    for dir_, _, files in os.walk(os.getcwd()):
+        for file_name in files:
+            rel_dir = os.path.relpath(dir_, os.getcwd())
+            if rel_dir == ".":
+                path = os.path.join(rel_dir, file_name)[1:len(os.path.join(rel_dir, file_name))] + "/"
+            else:
+                if rel_dir == ".gitt":
+                    continue
+                path = "/" + os.path.join(rel_dir, file_name) + "/"
+
+            fs.append(path)
+
+            r = requests.get(f"{base_url}/api/file-data/?username={username}&repo={repo}&path={path}").json()
+            print(r)
+            try:
+                r["error"]
+                with open(path[1:len(path)-1], "rb") as f:
+                    a = f.read()
+                    updates["new"].append([upload_s3(a, path), path])
+                    f.close()
+            except:
+                with open(path[1:len(path)-1], "rb") as f:
+                    a = f.read()
+                    b = get_s3(r["url"])
+                    if a != b:
+                        updates["changed"].append([upload_s3(a, path), path])
+                    f.close()
+
+    for _ in org:
+        if _ not in fs:
+            updates["delete"].append(_)
+
+    # print(fs, org)
+    print(updates)
+
+    commit_id = uuid.uuid4()
+
+    requests.post("{base_url}/api/commit/", data={
+        "username": username,
+        "repo": repo,
+        "data": json.dumps(updates),
+        "id": commit_id,
+        "message": message,
+        "branch": branch
+    })
+
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description = "CLI for GitHub Clone")
+    parser.add_argument("-clone", type=str, nargs=2, default=None, metavar=("username", "repo"),
+                        help = "Clone a repository")
+    parser.add_argument("-commit", nargs=2, default=None, metavar=("commit message", "branch"),
+                        help="")
+    parser.add_argument("--dev", help="Replace production base URL with dev URL")
+
+    args = parser.parse_args()
+
+    if args.clone is not None:
+        clone(args.clone[0], args.clone[1], base_url=args.dev)
+    elif args.commit is not None:
+        commit(args.commit[0], args.commit[1], base_url=args.dev)
+
+if __name__ == "__main__":
+    main()
+
+
+
