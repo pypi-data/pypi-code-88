@@ -1,0 +1,1 @@
+default_app_config = "yucebio_scheduler.web.django_mongo.apps.DjangoApschedulerConfig"
