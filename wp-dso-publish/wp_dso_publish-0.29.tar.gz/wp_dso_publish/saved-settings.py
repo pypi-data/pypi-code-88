@@ -1,0 +1,5 @@
+RESEARCH_APPROVAL_ID = '6c759d8a-311f-4f6d-ae7f-ffe8cf6d64a8'
+INFRASTRUCTURE_APPROVAL_ID = '7087d9eb-466f-4dcb-bd23-77b67d1c69db'
+DATASET_ID = '37af8d97-f7fd-456e-b6e8-d0a3292d56fc'
+PUBLIC_KEY_PATH = '/Users/ibaldin/workspace-impact/impact-docker-images/safe-server/example-impact/principals/wp/wp1.pub'
+SAFE_URL = 'http://localhost:7777/'
