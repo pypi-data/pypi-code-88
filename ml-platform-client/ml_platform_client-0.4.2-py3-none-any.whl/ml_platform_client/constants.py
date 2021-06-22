@@ -1,0 +1,7 @@
+TRAIN_STATUS_TRAINING = 'training'
+TRAIN_STATUS_ERROR = 'error'
+TRAIN_STATUS_UNKNOWN = 'unknown'
+TRAIN_STATUS_COMPLETED = 'completed'
+
+MODE_STANDALONE = 'standalone'
+MODE_CLUSTER = 'cluster'
