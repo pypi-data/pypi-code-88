@@ -1,0 +1,2 @@
+AUTHORIZATION_HEADER = "authorization"
+BASIC_AUTH_PREFIX = "Basic"
