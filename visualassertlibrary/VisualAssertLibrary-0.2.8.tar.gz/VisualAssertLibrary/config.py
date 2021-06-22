@@ -1,0 +1,1 @@
+DIR_FOR_SCREENSHOTS_IN_REPORT = "visual_tests_screenshots"
