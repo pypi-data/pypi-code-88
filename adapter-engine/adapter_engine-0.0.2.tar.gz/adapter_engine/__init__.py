@@ -1,0 +1,8 @@
+__title__ = 'adapter_engine'
+__version__ = '0.0.2'
+__author__ = 'Kali-Team'
+__author_email__ = 'root@kali-team.cn'
+__license__ = 'GPL 2.0'
+__copyright__ = 'Copyright 2021 Kali-Team'
+__name__ = 'adapter_engine'
+__package__ = 'adapter_engine'
