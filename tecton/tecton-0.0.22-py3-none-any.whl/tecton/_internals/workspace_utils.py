@@ -1,0 +1,6 @@
+PROD_WORKSPACE_NAME_SERVER = ""
+PROD_WORKSPACE_NAME_CLIENT = "prod"
+
+
+def server_to_client_name(ws):
+    return PROD_WORKSPACE_NAME_CLIENT if ws == PROD_WORKSPACE_NAME_SERVER else ws

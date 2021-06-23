@@ -1,0 +1,172 @@
+import argparse
+import sys
+from dataclasses import dataclass
+from typing import Callable
+
+from tecton import conf
+from tecton import Workspace
+from tecton._internals import metadata_service
+from tecton._internals.workspace_utils import PROD_WORKSPACE_NAME_CLIENT
+from tecton.cli import printer
+from tecton.cli.common import get_current_workspace
+from tecton.cli.common import is_materializable_workspace
+from tecton.cli.engine import update_tecton_state
+from tecton_proto.metadataservice.metadata_service_pb2 import CreateWorkspaceRequest
+from tecton_proto.metadataservice.metadata_service_pb2 import DeleteWorkspaceRequest
+from tecton_proto.metadataservice.metadata_service_pb2 import ListWorkspacesRequest
+
+
+@dataclass
+class WorkspaceCommand:
+    command: str
+    description: str
+    handler: Callable
+
+
+def command_select(args):
+    # validate
+    workspace_names = list_workspaces()
+    if args.workspace not in workspace_names:
+        printer.safe_print(
+            f'Workspace "{args.workspace}" not found. Run `tecton workspace list` to see list of available workspaces.'
+        )
+        sys.exit(1)
+
+    # switch
+    switch_to_workspace(args.workspace)
+
+
+def command_list():
+    current_workspace = get_current_workspace()
+    workspace_names = list_workspaces()
+    for name in workspace_names:
+        if name == current_workspace:
+            printer.safe_print(f"* {name}")
+        else:
+            printer.safe_print(f"  {name}")
+
+
+def command_show():
+    printer.safe_print(get_current_workspace())
+
+
+def command_create(args):
+    # validate
+    if not args.workspace or args.workspace == PROD_WORKSPACE_NAME_CLIENT:
+        printer.safe_print(f"New workspace '{PROD_WORKSPACE_NAME_CLIENT}' not allowed.")
+        sys.exit(1)
+
+    # There is a check for this on the server side too, but we optimistically validate
+    # here as well to show a pretty error message.
+    if args.workspace in list_workspaces():
+        printer.safe_print(f"Workspace {args.workspace} already exists", file=sys.stderr)
+        sys.exit(1)
+
+    # create
+    create_workspace(args.workspace, args.materialization_enabled)
+
+    # switch to new workspace
+    switch_to_workspace(args.workspace)
+    printer.safe_print(
+        """
+You're now on a new, empty workspace. Workspaces isolate their state,
+so if you run "tecton plan" Tecton will not see any existing state
+for this configuration.
+    """
+    )
+
+
+def command_delete(args):
+    # validate
+    if args.workspace == PROD_WORKSPACE_NAME_CLIENT:
+        printer.safe_print(f"Deleting workspace '{PROD_WORKSPACE_NAME_CLIENT}' not allowed.")
+        sys.exit(1)
+
+    interactive = is_materializable_workspace(args.workspace)
+
+    # confirm deletion
+    confirmation = "y" if args.yes else None
+    while confirmation not in ("y", "n", ""):
+        confirmation = (
+            input(f'Are you sure you want to delete the workspace "{args.workspace}"? (y/N) ').lower().strip()
+        )
+    if confirmation == "n" or confirmation == "":
+        printer.safe_print("Cancelling delete action.")
+        sys.exit(1)
+
+    # archive all fcos in the remote state unconditionally.
+    # This will need to be updated when workspaces support materialization.
+    with Workspace(args.workspace):
+        update_tecton_state(
+            objects=[], repo_root="", repo_files=[], apply=True, interactive=interactive, debug=False, upgrade_all=False
+        )
+
+    # delete
+    delete_workspace(args.workspace)
+
+    # switch to prod if deleted current
+    if args.workspace == get_current_workspace():
+        switch_to_workspace(PROD_WORKSPACE_NAME_CLIENT)
+
+
+COMMANDS = [
+    WorkspaceCommand("show", description="show active workspace", handler=lambda args: command_show()),
+    WorkspaceCommand("create", description="create a new workspace", handler=lambda args: command_create(args)),
+    WorkspaceCommand("select", description="select a workspace", handler=lambda args: command_select(args)),
+    WorkspaceCommand("list", description="list available workspaces", handler=lambda args: command_list()),
+    WorkspaceCommand("delete", description="delete workspace", handler=lambda args: command_delete(args)),
+]
+
+
+def switch_to_workspace(workspace_name: str):
+    conf.set("TECTON_WORKSPACE", workspace_name)
+    conf._save_tecton_config()
+    printer.safe_print(f'Switched to workspace "{workspace_name}".')
+
+
+def create_workspace(workspace_name: str, materializable: bool):
+    request = CreateWorkspaceRequest()
+    request.workspace_name = workspace_name
+    request.capabilities.materializable = materializable
+    metadata_service.instance().CreateWorkspace(request)
+    printer.safe_print(f'Created workspace "{workspace_name}".')
+
+
+def delete_workspace(workspace_name: str):
+    with Workspace(workspace_name):
+        request = DeleteWorkspaceRequest()
+        request.workspace = workspace_name
+        metadata_service.instance().DeleteWorkspace(request)
+    printer.safe_print(f'Deleted workspace "{workspace_name}".')
+
+
+def list_workspaces():
+    request = ListWorkspacesRequest()
+    response = metadata_service.instance().ListWorkspaces(request)
+    workspace_names = [PROD_WORKSPACE_NAME_CLIENT] + [workspace.name for workspace in response.workspaces]
+    return workspace_names
+
+
+def run_workspace_command(args):
+    for command in COMMANDS:
+        if args.workspace_command == command.command:
+            command.handler(args)
+            break
+    else:
+        printer.safe_print(args)
+        printer.safe_print("Unknown command", args.command.strip(), file=sys.stderr)
+        sys.exit(1)
+
+
+def build_parser(root_parser):
+    workspace_parsers = root_parser.add_subparsers(dest="workspace_command", help="List of workspace commands")
+    workspace_parsers.required = True
+
+    for c in COMMANDS:
+        p = workspace_parsers.add_parser(c.command, help=c.description)
+        if c.command in {"select", "delete", "create"}:
+            p.add_argument("workspace", help="workspace name")
+        if c.command == "create":
+            p.add_argument("--materialization-enabled", action="store_true", help=argparse.SUPPRESS)
+        if c.command == "delete":
+            p.add_argument("-y", "--yes", action="store_true")
