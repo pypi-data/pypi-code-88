@@ -1,0 +1,39 @@
+from setuptools import setup, find_packages
+
+with open('README.md') as readme_file:
+    README = readme_file.read()
+
+setup(
+  name = 'rct_modelpool',
+  packages = find_packages(exclude=[]),
+  version = '0.1.1b',
+  license='MIT',
+  description = 'Hub for rct models',
+  long_description_content_type="text/markdown",
+  long_description=README,
+  author = 'Shen Dezhou',
+  author_email = 'shendezhou@rct.ai',
+  url = 'https://github.com/rct-ai/rct-modelpool',
+  keywords = [
+    'artificial intelligence',
+    'deep learning',
+    'attention free transformer',
+    'self-attention',
+    'transformer',
+    'natural language processing'
+  ],
+  install_requires=[
+    'torch>=1.6'
+  ],
+  classifiers=[
+    'Development Status :: 4 - Beta',
+    'Intended Audience :: Developers',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence',
+    'License :: OSI Approved :: MIT License',
+    'Programming Language :: Python :: 3.6',
+    'Programming Language :: Python :: 3.7',
+    'Programming Language :: Python :: 3.8',
+    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10'
+  ],
+)
