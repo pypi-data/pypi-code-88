@@ -1,0 +1,4 @@
+
+
+class MalformedMetaClassException(Exception):
+    pass
