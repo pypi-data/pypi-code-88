@@ -1,0 +1,11 @@
+baseVersion = '5.4.0'
+cgcloudVersion = '1.6.0a1.dev393'
+version = '5.4.0-87293d63fa6c76f03bed3adf93414ffee67bf9a7'
+distVersion = '5.4.0'
+exactPython = 'python3.6'
+python = 'python3.6'
+dockerTag = '5.4.0-87293d63fa6c76f03bed3adf93414ffee67bf9a7-py3.6'
+currentCommit = '87293d63fa6c76f03bed3adf93414ffee67bf9a7'
+dockerRegistry = 'quay.io/ucsc_cgl'
+dockerName = 'toil'
+dirty = False
