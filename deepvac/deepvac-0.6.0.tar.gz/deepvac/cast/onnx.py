@@ -1,0 +1,16 @@
+from ..utils import LOG
+from .base import DeepvacCast
+
+class OnnxCast(DeepvacCast):
+    def auditConfig(self):
+        if not self.config.onnx_model_dir:
+            return False
+        return True
+
+    def process(self, cast_output_file=None):
+        output_onnx_file = self.config.onnx_model_dir
+        if cast_output_file:
+            output_onnx_file = '{}/onnx__{}.onnx'.format(self.trainer_config.output_dir, cast_output_file)
+            self.config.onnx_model_dir = output_onnx_file
+        LOG.logI("config.cast.OnnxCast.onnx_model_dir found, save onnx model to {}...".format(output_onnx_file))
+        self.exportOnnx()
