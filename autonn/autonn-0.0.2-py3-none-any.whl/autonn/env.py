@@ -1,0 +1,3 @@
+import os
+
+ENABLE_OSS_INTERNEL_ACCESS = int(os.getenv("ENABLE_OSS_INTERNEL_ACCESS") or 0) == 1
