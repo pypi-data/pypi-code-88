@@ -1,0 +1,15 @@
+from dataclasses import dataclass
+
+from .artifact import _Base
+from .git_version import GitVersion
+
+
+@dataclass
+class __CodeData:
+    gitVersion: GitVersion
+
+
+@dataclass
+class CodeVersion(_Base, __CodeData):
+    def __post_init__(self):
+        self.parentName = self.gitVersion.repositoryName
