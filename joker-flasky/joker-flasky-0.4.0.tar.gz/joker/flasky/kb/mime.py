@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+# https://www.ibm.com/docs/en/wkc/cloud?topic=catalog-previews
+# https://docs.microsoft.com/en-us/previous-versions/office/office-2007-resource-kit/ee309278(v=office.12)?redirectedfrom=MSDN
+MIME_TYPES = {
+    '.bmp': 'image/bmp',
+    '.doc': 'application/msword',
+    '.docm': 'application/vnd.ms-word.document.macroEnabled.12',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.dot': 'application/msword',
+    '.dotm': 'application/vnd.ms-word.template.macroEnabled.12',
+    '.dotx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.template',
+    '.gif': 'image/gif',
+    '.html': 'text/html',
+    '.jpeg': 'image/jpeg',
+    '.jpg': 'image/jpeg',
+    '.mdb': 'application/vnd.ms-access',
+    '.pdf': 'application/pdf',
+    '.png': 'image/png',
+    '.pot': 'application/vnd.ms-powerpoint',
+    '.potm': 'application/vnd.ms-powerpoint.template.macroEnabled.12',
+    '.potx': 'application/vnd.openxmlformats-officedocument.presentationml.template',
+    '.ppa': 'application/vnd.ms-powerpoint',
+    '.ppam': 'application/vnd.ms-powerpoint.addin.macroEnabled.12',
+    '.pps': 'application/vnd.openxmlformats-officedocument.presentationml.slideshow',
+    '.ppsm': 'application/vnd.ms-powerpoint.slideshow.macroEnabled.12',
+    '.ppsx': 'application/vnd.openxmlformats-officedocument.presentationml.slideshow',
+    '.ppt': 'application/vnd.ms-powerpoint',
+    '.pptm': 'application/vnd.ms-powerpoint.presentation.macroEnabled.12',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    '.rtf': 'application/rtf',
+    '.rtf2': 'text/rtf',
+    '.txt': 'text/plain',
+    '.xla': 'application/vnd.ms-excel',
+    '.xlam': 'application/vnd.ms-excel.addin.macroEnabled.12',
+    '.xls': 'application/vnd.ms-excel',
+    '.xlsb': 'application/vnd.ms-excel.sheet.binary.macroEnabled.12',
+    '.xlsm': 'application/vnd.ms-excel.sheet.macroEnabled.12',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.xlt': 'application/vnd.ms-excel',
+    '.xltm': 'application/vnd.ms-excel.template.macroEnabled.12',
+    '.xltx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.template',
+    '.json': 'application/json',
+    '.js': 'application/javascript'
+}
