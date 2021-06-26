@@ -1,0 +1,1 @@
+print("This is __init__ demo_example_pkg")
