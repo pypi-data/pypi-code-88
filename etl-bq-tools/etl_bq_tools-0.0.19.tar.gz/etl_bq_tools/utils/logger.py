@@ -1,0 +1,18 @@
+def get_logger(filename):
+    """
+    :param project_path: path_root
+    :param filename: file.txt
+    :return:
+    """
+    import logging
+
+    if not filename:
+        raise Exception('require var filename: {file_path.txt} ')
+
+    logging.basicConfig(
+        filename=filename,
+        format="[%(levelname)s]%(asctime)s:%(name)s:%(message)s",
+        datefmt='%Y-%m-%d %H:%M:%S')
+    logger = logging.getLogger('main')
+    logger.setLevel(logging.INFO)
+    return logger
