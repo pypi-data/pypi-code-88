@@ -1,0 +1,3 @@
+"""Main module."""
+
+print("test")
