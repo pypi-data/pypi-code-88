@@ -1,0 +1,1 @@
+from CryptoTokenAuth.authentication import TokenAuthentication
