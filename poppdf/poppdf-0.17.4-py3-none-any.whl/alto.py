@@ -1,0 +1,527 @@
+# -*- coding: utf-8 -*-
+
+"""Top-level package for Alto."""
+
+__author__ = "Rémi Delbouys"
+__email__ = "remi.delbouys@laposte.net"
+# Do not edit this string manually, always use bumpversion
+# Details in CONTRIBUTING.md
+__version__ = "0.0.5"
+
+
+def get_module_version():
+    return __version__
+
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union, cast
+from xml.etree import ElementTree
+from xml.etree.ElementTree import Element
+
+from typing_extensions import Literal  # for python3.7 compatibility
+
+_MAX_PRINT_CHILDREN = 50
+_Namespace = "{http://www.loc.gov/standards/alto/ns-v3#}"
+
+
+class _Tags:
+    DESCRIPTION = f"{_Namespace}Description"
+    LAYOUT = f"{_Namespace}Layout"
+    PAGE = f"{_Namespace}Page"
+    TEXT_BLOCK = f"{_Namespace}TextBlock"
+    TEXT_LINE = f"{_Namespace}TextLine"
+    String = f"{_Namespace}String"
+    SP = f"{_Namespace}SP"
+    SOURCE_IMAGE_INFORMATION = f"{_Namespace}sourceImageInformation"
+    COMPOSED_BLOCK = f"{_Namespace}ComposedBlock"
+    PRINTSPACE = f"{_Namespace}PrintSpace"
+    FILENAME = f"{_Namespace}fileName"
+
+
+class _Attrs:
+    ID = "ID"
+    HEIGHT = "HEIGHT"
+    WIDTH = "WIDTH"
+    HPOS = "HPOS"
+    VPOS = "VPOS"
+    FONTSIZE = "FONTSIZE"
+    CONTENT = "CONTENT"
+    WC = "WC"
+    PC = "PC"
+    PHYSICAL_IMG_NR = "PHYSICAL_IMG_NR"
+    PRINTED_IMG_NR = "PRINTED_IMG_NR"
+    FONTSIZE = "FONTSIZE"
+
+
+T2 = TypeVar("T2")
+GroupLevel = Union[Literal['TextLine'], Literal['TextBlock'], Literal['ComposedBlock']]
+
+
+def _check_type(candidate: Any, type_: Type[T2]) -> T2:
+    if not isinstance(candidate, type_):
+        raise ValueError(f"Expecting type {type_}, got {type(candidate)}")
+    return candidate
+
+
+def _assert_str(candidate: Any) -> str:
+    return _check_type(candidate, str)
+
+
+def _extract_unique_child_name_to_child(element: Element) -> Dict[str, Element]:
+    res: Dict[str, Element] = {}
+    for child in element:
+        if child.tag in res:
+            raise ValueError(f"Non unique child tag name: {child} in element {element.tag}")
+        res[child.tag] = child
+    return res
+
+
+def _get_tag(element_tag_name: str, children: Dict[str, Element], tag_name: str) -> Element:
+    if tag_name not in children:
+        raise ValueError(
+            f"Error when parsing XML: expecting tag {element_tag_name} to have child {tag_name}. "
+            f"Available children: {list(children.keys())[:_MAX_PRINT_CHILDREN]}"
+        )
+    return children[tag_name]
+
+
+T = TypeVar("T", bound=Union[int, str, float])
+
+
+def _get_attr(element: Element, attr_name: str, type_: Type[T]) -> T:
+    attrs = cast(Dict, element.attrib)
+    if attr_name not in attrs:
+        raise ValueError(
+            f"Error when parsing XML: expecting tag {element.tag} to have attribute {attr_name}. "
+            f"Available attributes: {list(attrs.keys())[:_MAX_PRINT_CHILDREN]}"
+        )
+    value = attrs[attr_name]
+    try:
+        res = type_(value)
+        return res  # type: ignore
+    except TypeError:
+        raise ValueError(
+            f"Error when parsing XML: expecting tag attribute {attr_name} of tag {element.tag} "
+            f"to have type {type_}, got {type(value)}."
+        )
+
+
+def _assert_name_is(name: str, expected: str) -> None:
+    if name != expected:
+        raise ValueError(f"Error when parsing XML: Expecting tag name {expected}, got tag name {name}")
+
+
+@dataclass
+class Description:
+    file_name: Optional[str]
+
+    @classmethod
+    def from_xml(cls, element: Element) -> "Description":
+        children = _extract_unique_child_name_to_child(element)
+        source = _get_tag(element.tag, children, _Tags.SOURCE_IMAGE_INFORMATION)
+        file_name = _get_tag(source.tag, _extract_unique_child_name_to_child(source), _Tags.FILENAME)
+        return cls(file_name.text)
+
+
+@dataclass
+class Alternative:
+    content: str
+
+    @classmethod
+    def from_xml(cls, element: Element) -> "Alternative":
+        return cls(content=_assert_str(element.text))
+
+
+@dataclass
+class String:
+    id: str
+    width:float
+    height:float
+    left: float
+    top:float
+    right: float
+    bottom: float
+    content: str
+    confidence: float
+    alternatives: List[Alternative]
+
+    @classmethod
+    def from_xml(cls, element: Element, x_scale, y_scale) -> "String":
+        return cls(
+            id=_get_attr(element, _Attrs.ID, str),
+            height=_get_attr(element, _Attrs.HEIGHT, float)*y_scale,
+            width=_get_attr(element, _Attrs.WIDTH, float)*x_scale,
+            left=_get_attr(element, _Attrs.HPOS, float)*x_scale,
+            top=_get_attr(element, _Attrs.VPOS, float)*x_scale,
+            right=_get_attr(element, _Attrs.HPOS, float)*x_scale+_get_attr(element, _Attrs.WIDTH, float)*x_scale,
+            bottom=_get_attr(element, _Attrs.VPOS, float)*x_scale+_get_attr(element, _Attrs.HEIGHT, float)*y_scale,
+            content=_get_attr(element, _Attrs.CONTENT, str),
+            confidence=_get_attr(element, _Attrs.WC, float),
+            alternatives=[Alternative.from_xml(child) for child in element],
+        )
+
+
+@dataclass
+class SP:
+    width:float
+    left: float
+    right:float
+    top:float
+
+    @classmethod
+    def from_xml(cls, element: Element, x_scale, y_scale) -> "SP":
+        return cls(
+            width=_get_attr(element, _Attrs.WIDTH, float)*x_scale,
+            left=_get_attr(element, _Attrs.HPOS, float)*x_scale,
+            top=_get_attr(element, _Attrs.VPOS, float)*y_scale,
+            right=_get_attr(element, _Attrs.HPOS, float) * x_scale + _get_attr(element, _Attrs.WIDTH, float) * x_scale,
+        )
+
+
+def _load_string_or_sp(element: Element, x_scale, y_scale) -> Union[String, SP]:
+    if element.tag == _Tags.String:
+        return String.from_xml(element, x_scale, y_scale)
+    if element.tag == _Tags.SP:
+        return SP.from_xml(element, x_scale, y_scale)
+    raise ValueError(f"Error in when parsing XML: expecting tag {_Tags.String} or {_Tags.SP}, got {element.tag}")
+
+
+@dataclass
+class TextLine:
+    id: str
+    width:float
+    height:float
+    left: float
+    right:float
+    bottom:float
+    top:float
+
+    strings: List[Union[String, SP]]
+
+    @classmethod
+    def from_xml(cls, element: Element, x_scale, y_scale) -> "TextLine":
+        _assert_name_is(element.tag, _Tags.TEXT_LINE)
+        return cls(
+            id=_get_attr(element, _Attrs.ID, str),
+            height=_get_attr(element, _Attrs.HEIGHT, float)*y_scale,
+            width=_get_attr(element, _Attrs.WIDTH, float)*x_scale,
+            left=_get_attr(element, _Attrs.HPOS, float)*x_scale,
+            top=_get_attr(element, _Attrs.VPOS, float)*y_scale,
+            right = _get_attr(element, _Attrs.HPOS, float) * x_scale + _get_attr(element, _Attrs.WIDTH, float) * x_scale,
+            bottom=_get_attr(element, _Attrs.VPOS, float) * x_scale + _get_attr(element, _Attrs.HEIGHT,
+                                                                                float) * y_scale,
+            strings=[_load_string_or_sp(child, x_scale, y_scale) for child in element],
+        )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.height,
+                self.width,
+                self.left,
+                self.height,
+                tuple(self.extract_words()),
+            )
+        )
+
+    def extract_words(self) -> List[str]:
+        """
+        Extracts all parsed words regardless of their positions.
+        Returns:
+            List[str]: List of words extracted from file
+        """
+
+        return [str_.content for str_ in self.strings if isinstance(str_, String)]
+
+
+@dataclass
+class TextBlock:
+    id: Optional[str]
+    width:float
+    height:float
+    right:float
+    bottom:float
+    left: float
+    top:float
+
+    text_lines: List[TextLine]
+
+    @classmethod
+    def from_xml(cls, element: Element, x_scale, y_scale) -> "TextBlock":
+        _assert_name_is(element.tag, _Tags.TEXT_BLOCK)
+        return cls(
+            id=_get_attr(element, _Attrs.ID, str),
+            height=_get_attr(element, _Attrs.HEIGHT, float)*y_scale,
+            width=_get_attr(element, _Attrs.WIDTH, float)*x_scale,
+            left=_get_attr(element, _Attrs.HPOS, float)*x_scale,
+            top=_get_attr(element, _Attrs.VPOS, float)*x_scale,
+            right=_get_attr(element, _Attrs.HPOS, float) * x_scale + _get_attr(element, _Attrs.WIDTH, float) * x_scale,
+            bottom=_get_attr(element, _Attrs.VPOS, float) * x_scale + _get_attr(element, _Attrs.HEIGHT,
+                                                                                float) * y_scale,
+            text_lines=[TextLine.from_xml(child,x_scale, y_scale) for child in element],
+        )
+
+    def extract_string_lines(self) -> List[str]:
+        return [" ".join(line.extract_words()) for line in self.text_lines]
+
+    def extract_words(self) -> List[str]:
+        """
+        Extracts all parsed words regardless of their positions.
+        Returns:
+            List[str]: List of words extracted from file
+        """
+
+        return [str_ for line in self.text_lines for str_ in line.extract_words()]
+
+
+@dataclass
+class ComposedBlock:
+    id: str
+    width:float
+    height:float
+    left: float
+    right:float
+    bottom:float
+    top:float
+
+    text_blocks: List[TextBlock]
+
+    @classmethod
+
+    def from_xml(cls, element: Element,x_scale, y_scale) -> "ComposedBlock":
+        _assert_name_is(element.tag, _Tags.COMPOSED_BLOCK)
+        return cls(
+            height=_get_attr(element, _Attrs.HEIGHT, float)*y_scale,
+            width=_get_attr(element, _Attrs.WIDTH, float)*x_scale,
+            left=_get_attr(element, _Attrs.HPOS, float)*x_scale,
+            top=_get_attr(element, _Attrs.VPOS, float)*y_scale,
+            right=_get_attr(element, _Attrs.HPOS, float) * x_scale + _get_attr(element, _Attrs.WIDTH, float) * x_scale,
+            bottom=_get_attr(element, _Attrs.VPOS, float) * x_scale + _get_attr(element, _Attrs.HEIGHT,
+                                                                                float) * y_scale,
+            id=_get_attr(element, _Attrs.ID, str),
+            text_blocks=[TextBlock.from_xml(child, x_scale, y_scale) for child in element],
+        )
+
+    def extract_words(self) -> List[str]:
+        """
+        Extracts all parsed words regardless of their positions.
+        Returns:
+            List[str]: List of words extracted from file
+        """
+
+        return [str_ for block in self.text_blocks for str_ in block.extract_words()]
+
+
+@dataclass
+class PrintSpace:
+    height: float
+    width: float
+    hpos: float
+    vpos: float
+    pc: Optional[float]
+    composed_blocks: List[ComposedBlock]
+
+    @classmethod
+    def from_xml(cls, element: Element, x_scale, y_scale) -> "PrintSpace":
+        _assert_name_is(element.tag, _Tags.PRINTSPACE)
+        return cls(
+            height=_get_attr(element, _Attrs.HEIGHT, float)*y_scale,
+            width=_get_attr(element, _Attrs.WIDTH, float)*x_scale,
+            hpos=_get_attr(element, _Attrs.HPOS, float)*x_scale,
+            vpos=_get_attr(element, _Attrs.VPOS, float)*y_scale,
+            pc=_get_attr(element, _Attrs.PC, float) if _Attrs.PC in element.attrib else None,
+            composed_blocks=[ComposedBlock.from_xml(child, x_scale, y_scale) for child in element],
+        )
+
+    def extract_words(self) -> List[str]:
+        """
+        Extracts all parsed words regardless of their positions.
+        Returns:
+            List[str]: List of words extracted from file
+        """
+
+        return [str_ for block in self.composed_blocks for str_ in block.extract_words()]
+
+
+@dataclass
+class Page:
+    id: str
+    height: float
+    width: float
+    physical_img_nr: int
+    printed_img_nr: Optional[int]
+    print_spaces: List[PrintSpace]
+
+    @classmethod
+    def from_xml(cls, element: Element, x_scale, y_scale) -> "Page":
+        _assert_name_is(element.tag, _Tags.PAGE)
+        return cls(
+            id=_get_attr(element, _Attrs.ID, str),
+            height=_get_attr(element, _Attrs.HEIGHT, float),
+            width=_get_attr(element, _Attrs.WIDTH, float),
+            physical_img_nr=_get_attr(element, _Attrs.PHYSICAL_IMG_NR, int),
+            printed_img_nr=_get_attr(element, _Attrs.PRINTED_IMG_NR, int)
+            if _Attrs.PRINTED_IMG_NR in element.attrib
+            else None,
+            print_spaces=[PrintSpace.from_xml(child, x_scale, y_scale) for child in element],
+        )
+
+    def extract_blocks(self) -> List[ComposedBlock]:
+        return [block for ps in self.print_spaces for block in ps.composed_blocks]
+
+    def extract_text_blocks(self) -> List[TextBlock]:
+        return [tb for ps in self.print_spaces for block in ps.composed_blocks for tb in block.text_blocks]
+
+    def extract_strings(self) -> List[String]:
+        return [
+            string
+            for ps in self.print_spaces
+            for block in ps.composed_blocks
+            for tb in block.text_blocks
+            for line in tb.text_lines
+            for string in line.strings
+            if isinstance(string, String)
+        ]
+
+    def extract_lines(self) -> List[TextLine]:
+        return [
+            line
+            for ps in self.print_spaces
+            for block in ps.composed_blocks
+            for tb in block.text_blocks
+            for line in tb.text_lines
+        ]
+
+    def extract_words(self) -> List[str]:
+        """
+        Extracts all parsed words regardless of their positions.
+        Returns:
+            List[str]: List of words extracted from file
+        """
+
+        return [str_ for ps in self.print_spaces for str_ in ps.extract_words()]
+
+
+@dataclass
+class Layout:
+    pages: List[Page]
+
+    @classmethod
+    def from_xml(cls, element: Element,x_scale, y_scale) -> "Layout":
+        return cls(pages=[Page.from_xml(child,x_scale, y_scale) for child in element])
+
+
+@dataclass
+class Alto:
+    """
+    Alto dataclass for manipulating Tesseract output files.
+    Parameters
+    ----------
+    description: Description
+        The "description" tag of alto xml documents, containing metadata
+    layout: Layout
+        The "layout" tag of alto xml documents, containing parsed elements
+    """
+
+    description: Description
+    layout: Layout
+
+    @classmethod
+    def from_xml(cls, element: Element, x_scale, y_scale) -> "Alto":
+        children = _extract_unique_child_name_to_child(element)
+        return cls(
+            description=Description.from_xml(_get_tag(element.tag, children, _Tags.DESCRIPTION)),
+            layout=Layout.from_xml(_get_tag(element.tag, children, _Tags.LAYOUT), x_scale, y_scale),
+        )
+
+    @staticmethod
+    def parse_file(filename: str) -> "Alto":
+        """
+        Alto constructor from xml file.
+        Parameters
+        ----------
+        filename: str
+            filename of the file to load
+        """
+        tree = ElementTree.parse(filename)
+        return Alto.from_xml(tree.getroot())
+
+    @staticmethod
+    def parse(xml_str: str, x_scale, y_scale) -> "Alto":
+        """
+        Alto constructor from xml string.
+        Parameters
+        ----------
+        xml_str: str
+            xml alto string
+        """
+
+        tree = ElementTree.fromstring(xml_str)
+        return Alto.from_xml(tree, x_scale, y_scale)
+
+    def extract_words(self):
+        """
+        Extracts all parsed words regardless of their positions.
+        Returns:
+            List[str]: List of words extracted from file
+        """
+
+        return [
+            string
+            for page in self.layout.pages
+            for ps in page.print_spaces
+            for block in ps.composed_blocks
+            for tb in block.text_blocks
+            for line in tb.text_lines
+            for string in line.strings
+            if isinstance(string, String)
+        ]
+
+    def extract_composed_blocks(self) -> List[ComposedBlock]:
+        return [block for page in self.layout.pages for ps in page.print_spaces for block in ps.composed_blocks]
+
+    def extract_text_blocks(self) -> List[TextBlock]:
+        return [tb for block in self.extract_composed_blocks() for tb in block.text_blocks]
+
+    def extract_text_lines(self) -> List[TextLine]:
+        return [line for block in self.extract_text_blocks() for line in block.text_lines]
+
+    def extract_grouped_words(self, group_by: GroupLevel) -> List[List[str]]:
+        """Extracts all parsed words grouped at the required level.
+        Args:
+            group_by (Union[Literal['TextLine'], Literal['TextBlock'], Literal['ComposedBlock']]) : group level
+        Returns:
+            List[List[str]]: List of list of words in each entity of target level
+        """
+        groups: Union[List[ComposedBlock], List[TextBlock], List[TextLine]]
+        if group_by == 'ComposedBlock':
+            groups = self.extract_composed_blocks()
+        elif group_by == 'TextBlock':
+            groups = self.extract_text_blocks()
+        elif group_by == 'TextLine':
+            groups = self.extract_text_lines()
+        else:
+            raise NotImplementedError(f'Not implemented for value {group_by}')
+        return [[word for word in group.extract_words()] for group in groups]
+
+
+def parse_file(filename: str) -> Alto:
+    """
+    Alto constructor from xml file.
+    Parameters
+    ----------
+    filename: str
+        filename of the file to load
+    """
+    return Alto.parse_file(filename)
+
+
+def parse(xml_string: str, x_scale, y_scale) -> Alto:
+    """
+    Alto constructor from xml string.
+    Parameters
+    ----------
+    xml_str: str
+        xml alto string
+    """
+    return Alto.parse(xml_string, x_scale, y_scale)
