@@ -1,0 +1,1376 @@
+#%% modules
+import cv2, copy, os, sys, warnings
+import numpy as np
+
+import time
+
+from datetime import datetime
+from stat import S_IWRITE
+from ruamel.yaml import YAML
+from ruamel.yaml.constructor import SafeConstructor
+from watchdog.observers import Observer
+from watchdog.events import PatternMatchingEventHandler
+
+from phenopype.settings import colours, default_pype_config_name, default_pype_config
+from phenopype import presets
+
+## capture yaml output - temp
+from contextlib import redirect_stdout
+import io
+
+#%% settings
+
+def _construct_yaml_map(self, node):
+    # test if there are duplicate node keys
+    data = []
+    yield data
+    for key_node, value_node in node.value:
+        key = self.construct_object(key_node, deep=True)
+        val = self.construct_object(value_node, deep=True)
+        data.append((key, val))
+
+SafeConstructor.add_constructor(u'tag:yaml.org,2002:map', _construct_yaml_map)
+
+#%% classes
+
+
+class _image_viewer:
+    def __init__(self, image, **kwargs):
+        """
+        Low level interactive image function.
+        
+        Future versions of phenopype will feature a more clean and userfriendly
+        code structure.
+        
+        Parameters
+        ----------
+
+
+        """
+        ## kwargs
+        self.flag_tool = kwargs.get("tool", None)
+        self.flag_zoom_mode = kwargs.get("zoom", "continuous")
+        self.zoom_mag = kwargs.get("mag", 0.7)
+        self.zoom_n_steps = kwargs.get("steps", 20)
+        self.wait_time = 100
+        self.window_name = kwargs.get("window_name", "phenopype")
+        window_aspect = kwargs.get("window_aspect", cv2.WINDOW_AUTOSIZE)
+        window_control = kwargs.get("window_control", "internal")
+        max_dim = kwargs.get("max_dim", None)
+        if max_dim.__class__.__name__ == "NoneType":
+            max_dim = 1000
+        window_max_dimension = max_dim
+
+        ## new kwargs
+        self.flag_test_mode = kwargs.get("test_mode", False)
+        
+        ## create original binary image 
+        self.df_contours = kwargs.get("df_contours", None)
+        if self.df_contours.__class__.__name__ == "DataFrame":
+            self.image_bin = np.zeros_like(image)
+            for index, row in self.df_contours.iterrows():
+                cv2.drawContours(
+                    image=self.image_bin,
+                    contours=[row["coords"]],
+                    contourIdx=0,
+                    thickness=-1,
+                    color=colours["white"],
+                    maxLevel=3,
+                    offset=None,
+                )
+                
+            self.image_bin_copy = copy.deepcopy(self.image_bin)
+            
+            ## convert binary image to colour mask
+            self._bin2colmask(image, self.image_bin)
+            
+        ## resize image canvas
+        image_width, image_height = image.shape[1], image.shape[0]
+        if image_height > window_max_dimension or image_width > window_max_dimension:
+            if image_width > image_height:
+                canvas = cv2.resize(
+                    image,
+                    (
+                        window_max_dimension,
+                        int((window_max_dimension / image_width) * image_height),
+                    ),
+                    cv2.INTER_AREA,
+                )
+                if self.df_contours.__class__.__name__ == "DataFrame":
+                    self.colour_mask = cv2.resize(
+                        self.colour_mask_copy,
+                        (
+                            window_max_dimension,
+                            int((window_max_dimension / image_width) * image_height),
+                        ),
+                        cv2.INTER_AREA,
+                    )
+            else:
+                canvas = cv2.resize(
+                    image,
+                    (
+                        int((window_max_dimension / image_height) * image_width),
+                        window_max_dimension,
+                    ),
+                    cv2.INTER_AREA,
+                )
+                if self.df_contours.__class__.__name__ == "DataFrame":
+                    self.colour_mask = cv2.resize(
+                        self.colour_mask_copy,
+                        (
+                            window_max_dimension,
+                            int((window_max_dimension / image_width) * image_height),
+                        ),
+                        cv2.INTER_AREA,
+                    )
+        else:
+            canvas = copy.deepcopy(image)
+
+        ## initialize
+        self.image = copy.deepcopy(image)
+        self.image_copy = copy.deepcopy(image)
+        self.canvas = copy.deepcopy(canvas)
+        self.canvas_copy = copy.deepcopy(canvas)
+        self.canvas_width, self.canvas_height = self.canvas.shape[1], self.canvas.shape[0]
+        self.image_width, self.image_height = self.image.shape[1], self.image.shape[0]
+        self.canvas_fx, self.canvas_fy = (
+            self.image_width / self.canvas_width,
+            self.image_height / self.canvas_height,
+        )
+        self.global_fx, self.global_fy = self.canvas_fx, self.canvas_fy
+
+        ## zoom config
+        self.zoom_x1, self.zoom_y1, self.zoom_x2, self.zoom_y2 = (
+            0,
+            0,
+            self.image_width,
+            self.image_height,
+        )
+        self.flag_zoom, self.zoom_idx = -1, 1
+        self.zoom_step_x, self.zoom_step_y = (
+            int(image_width / self.zoom_n_steps),
+            int(image_height / self.zoom_n_steps),
+        )
+        if self.flag_zoom_mode == "fixed":
+            mag = int(self.zoom_mag * self.zoom_n_steps)
+            self.zoom_step_x, self.zoom_step_y = (
+                mag * self.zoom_step_x,
+                mag * self.zoom_step_y,
+            )
+
+        ## interactive window
+        if self.flag_tool:
+            self.points, self.point_list = [], []
+            self.line_width = kwargs.get("line_width", _auto_line_width(image))
+            self.line_colour = colours[kwargs.get("line_colour", "green")]
+            if (
+                self.flag_tool == "rectangle"
+                or self.flag_tool == "rect"
+                or self.flag_tool == "template"
+            ):
+                self.rect_list, self.rect_start = [], None
+            elif self.flag_tool == "landmarks" or self.flag_tool == "landmark":
+                self.point_size = kwargs.get("point_size", _auto_point_size(image))
+                self.point_colour = colours[kwargs.get("point_colour", "red")]
+                self.text_size = kwargs.get("label_size", _auto_text_size(image))
+                self.text_width = kwargs.get("label_size", _auto_text_width(image))
+                self.label_colour = colours[kwargs.get("label_colour", "black")]
+            elif self.flag_tool == "draw":
+                self.drawing = False
+                self.line_width_orig = kwargs.get("line_width", _auto_line_width(image))
+                self.line_width = int(self.line_width_orig / ((self.zoom_x2 - self.zoom_x1) / self.image_width))
+                self.line_colour = colours[kwargs.get("line_colour", "red")]
+                self.colour_current = copy.deepcopy(self.line_colour)
+                self.zoom_flag = True
+                
+                self.colour_left = kwargs.get("colour_left", "white")
+                self.colour_right = kwargs.get("colour_right", "black")    
+
+                if not kwargs.get("previous"):
+                    self._canvasAndColmask()
+
+        ## this needs to be decluttered. there should only be one type of list 
+        ## (points, not rectangle separately). relevant parameters for the 
+        ## polylines should be forwarded from the functions themselves
+
+
+        ## update from previous call
+        if kwargs.get("previous"):
+            prev_attr = kwargs.get("previous")
+            prev_attr = {
+                i: prev_attr[i]
+                for i in prev_attr
+                if i not in ["canvas_copy", "canvas", "image_copy", "image"]
+            }
+            self.__dict__.update(copy.deepcopy(prev_attr))
+            if hasattr(self, "point_list"):
+                if (
+                    self.flag_tool == "rectangle"
+                    or self.flag_tool == "rect"
+                    or self.flag_tool == "template"
+                ) and not self.flag_test_mode == True:
+                    for point in self.point_list:
+                        cv2.polylines(
+                            self.image_copy,
+                            np.array([point]),
+                            False,
+                            colours["green"],
+                            self.line_width,
+                        )
+                    self.point_list = []
+                    self.canvas = self.image_copy[
+                        self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2,
+                    ]
+                    self.canvas = cv2.resize(
+                        self.canvas,
+                        (self.canvas_width, self.canvas_height),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    self.canvas_copy = copy.deepcopy(self.canvas)
+                elif self.flag_tool == "line" or self.flag_tool == "polyline" or self.flag_tool == "polygon" or self.flag_test_mode == True:
+                    for point in self.point_list:
+                        cv2.polylines(
+                            self.image_copy,
+                            np.array([point]),
+                            False,
+                            self.line_colour,
+                            self.line_width,
+                        ) 
+                        
+                    self.canvas = self.image_copy[
+                        self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2,
+                    ]
+                    self.canvas = cv2.resize(
+                        self.canvas,
+                        (self.canvas_width, self.canvas_height),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    self.canvas_copy = copy.deepcopy(self.canvas)
+                elif self.flag_tool == "draw":
+                    # draw all previous segments
+                    self.image_bin = copy.deepcopy(self.image_bin_copy)
+                    for segment in self.point_list:
+                        cv2.polylines(
+                            self.image_bin,
+                            np.array([segment[0]]),
+                            False,
+                            segment[1],
+                            segment[2],
+                            )
+                        
+                    ## convert binary image to colour mask
+                    self._bin2colmask(self.image_copy, self.image_bin)
+
+                    ## resize image and mask
+                    self.canvas = self.image_copy[
+                        self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+                    ]
+                    self.canvas = cv2.resize(
+                        self.canvas,
+                        (self.canvas_width, self.canvas_height),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    self.colour_mask = self.colour_mask[
+                        self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+                    ]
+                    self.colour_mask = cv2.resize(
+                        self.colour_mask,
+                        (self.canvas_width, self.canvas_height),
+                        interpolation=cv2.INTER_LINEAR,
+                    )    
+                    
+                    ## merge mask and canvas
+                    self._canvasAndColmask()
+
+        ## show canvas
+        self.done = False
+        self.finished = False
+        cv2.namedWindow(self.window_name, window_aspect)
+        cv2.startWindowThread()
+        cv2.setMouseCallback(self.window_name, self._on_mouse_plain)
+        cv2.resizeWindow(self.window_name, self.canvas_width, self.canvas_height)
+        
+        global global_end_while
+        global_end_while = False
+        
+        ## window control
+        self.keypress = None
+        if window_control == "internal":
+            
+            while not any([self.finished, self.done]):
+                cv2.imshow(self.window_name, self.canvas)
+                self.keypress = cv2.waitKey(500)     
+                if self.flag_test_mode == True:
+                    self.done = True
+                    self.finished = True
+                    cv2.waitKey(self.wait_time)
+                    cv2.destroyAllWindows()
+                elif self.flag_test_mode == False:
+                    if self.keypress == 13:
+                        self.done = True
+                        cv2.destroyAllWindows()
+                    elif self.keypress == 10:
+                        self.done = True
+                        self.finished = True
+                        cv2.destroyAllWindows()
+                    elif self.keypress == 27:
+                        cv2.destroyAllWindows()
+                        sys.exit("\n\nTERMINATE (by user)")
+                        print("end while")     
+                    ## remove last points
+                    elif self.keypress == 26:
+                        self.point_list = self.point_list[:-1]
+                        ## draw all segments
+                        self.image_bin = copy.deepcopy(self.image_bin_copy)
+                        for segment in self.point_list:
+                            cv2.polylines(
+                                self.image_bin,
+                                np.array([segment[0]]),
+                                False,
+                                segment[1],
+                                segment[2],
+                                )
+                            
+                        ## convert binary image to colour mask
+                        self._bin2colmask(self.image_copy, self.image_bin)
+            
+                        ## resize image and mask
+                        self.canvas = self.image_copy[
+                            self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+                        ]
+                        self.canvas = cv2.resize(
+                            self.canvas,
+                            (self.canvas_width, self.canvas_height),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                        self.colour_mask = self.colour_mask[
+                            self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+                        ]
+                        self.colour_mask = cv2.resize(
+                            self.colour_mask,
+                            (self.canvas_width, self.canvas_height),
+                            interpolation=cv2.INTER_LINEAR,
+                        )          
+                        
+                        ## merge mask and canvas
+                        self._canvasAndColmask()
+                        
+                        cv2.imshow(self.window_name, self.canvas)
+                    if global_end_while:
+                        break
+                        cv2.destroyAllWindows()
+            ## finish up
+            if (
+                self.flag_tool == "polygon"
+                or self.flag_tool == "poly"
+                or self.flag_tool == "free"
+            ):
+                if len(self.points) > 2:
+                    self.points.append(self.points[0])
+                    self.point_list.append(self.points)
+            elif (
+                self.flag_tool == "polyline"
+                or self.flag_tool == "polylines"
+                or self.flag_tool == "lines"
+            ):
+                if len(self.points) > 0:
+                    self.point_list.append(self.points)
+            elif (
+                self.flag_tool == "rectangle"
+                or self.flag_tool == "rect"
+                or self.flag_tool == "template"
+            ):
+                if len(self.rect_list) > 0:
+                    for rect in self.rect_list:
+                        xmin, ymin, xmax, ymax = rect
+                        self.point_list.append(
+                            [
+                                (xmin, ymin),
+                                (xmax, ymin),
+                                (xmax, ymax),
+                                (xmin, ymax),
+                                (xmin, ymin),
+                            ]
+                        )
+            elif self.flag_tool == "landmarks" or self.flag_tool == "landmark":
+                self.point_list.append(self.points)
+        else:
+            if self.flag_test_mode == True:
+                self.done = True
+                cv2.waitKey(self.wait_time)
+                cv2.destroyAllWindows()
+
+    def _on_mouse_plain(self, event, x, y, flags, params):
+        if event == cv2.EVENT_MOUSEWHEEL and not self.keypress == 9:
+            self.keypress = None
+            if flags > 0:
+                if self.zoom_idx < self.zoom_n_steps:
+                    self.flag_zoom = 1
+                    self.zoom_idx += 1
+                    if self.flag_zoom_mode == "continuous" or (
+                        self.flag_zoom_mode == "fixed" and self.zoom_idx == 2
+                    ):
+                        self._zoom_fun(x, y)
+            if flags < 0:
+                if self.zoom_idx > 1:
+                    self.flag_zoom = -1
+                    self.zoom_idx -= 1
+                    if self.flag_zoom_mode == "continuous" or (
+                        self.flag_zoom_mode == "fixed" and self.zoom_idx == 1
+                    ):
+                        self._zoom_fun(x, y)
+            self.x, self.y = x, y
+            cv2.imshow(self.window_name, self.canvas)
+
+        if self.flag_tool:
+            if self.flag_tool == "landmark" or self.flag_tool == "landmarks":
+                self._on_mouse_point(event, x, y)
+            elif self.flag_tool == "rectangle" or self.flag_tool == "rect":
+                self._on_mouse_rectangle(event, x, y, flags)
+            elif self.flag_tool == "polygon" or self.flag_tool == "poly":
+                self._on_mouse_polygon(event, x, y, flags)
+            elif self.flag_tool == "polyline" or self.flag_tool == "polylines":
+                self._on_mouse_polygon(event, x, y, flags, polyline=True)
+            elif self.flag_tool == "scale":
+                self._on_mouse_polygon(event, x, y, flags, scale=True)
+            elif self.flag_tool == "template":
+                self._on_mouse_rectangle(event, x, y, flags, template=True)
+            elif self.flag_tool == "draw":                
+                self._on_mouse_draw(event, x, y, flags)
+
+                
+    def _on_mouse_point(self, event, x, y):
+        if event == cv2.EVENT_LBUTTONDOWN:  
+            self.coords_original = (
+                int(self.zoom_x1 + (x * self.global_fx)),
+                int(self.zoom_y1 + (y * self.global_fy)),
+            )
+            self.points.append(self.coords_original)
+            cv2.circle(
+                self.image_copy,
+                self.coords_original,
+                self.point_size,
+                self.point_colour,
+                -1,
+            )
+            cv2.putText(
+                self.image_copy,
+                str(len(self.points)),
+                self.coords_original,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                self.text_size,
+                self.label_colour,
+                self.text_width,
+                cv2.LINE_AA,
+            )
+            self.canvas = self.image_copy[
+                self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+            ]
+            self.canvas = cv2.resize(
+                self.canvas,
+                (self.canvas_width, self.canvas_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            self.canvas_copy = copy.deepcopy(self.canvas)
+            cv2.imshow(self.window_name, self.canvas)
+        if event == cv2.EVENT_RBUTTONDOWN:
+            if len(self.points) > 0:
+                self.points = self.points[:-1]
+                self.image_copy = copy.deepcopy(self.image)
+                for point, idx in zip(self.points, range(len(self.points))):
+                    cv2.circle(
+                        self.image_copy, point, self.point_size, self.point_colour, -1
+                    )
+                    cv2.putText(
+                        self.image_copy,
+                        str(idx + 1),
+                        point,
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        self.text_size,
+                        self.label_colour,
+                        self.text_width,
+                        cv2.LINE_AA,
+                    )
+                self.canvas = self.image_copy[
+                    self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+                ]
+                self.canvas = cv2.resize(
+                    self.canvas,
+                    (self.canvas_width, self.canvas_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                self.canvas_copy = copy.deepcopy(self.canvas)
+                cv2.imshow(self.window_name, self.canvas)
+
+    def _on_mouse_polygon(self, event, x, y, flags, **kwargs):
+
+        ## kwargs
+        polyline = kwargs.get("polyline", False)
+        scale = kwargs.get("scale", False)
+
+        if event == cv2.EVENT_MOUSEMOVE:
+            if scale and self.flag_tool == "line" and len(self.points) == 2:
+                return
+            self.coords_original = (
+                int(self.zoom_x1 + (x * self.global_fx)),
+                int(self.zoom_y1 + (y * self.global_fy)),
+            )
+            if len(self.points) > 0:
+                self.coords_prev = (
+                    int((self.points[-1][0] - self.zoom_x1) / self.global_fx),
+                    int((self.points[-1][1] - self.zoom_y1) // self.global_fy),
+                )
+                self.canvas = copy.deepcopy(self.canvas_copy)
+                cv2.line(
+                    self.canvas,
+                    self.coords_prev,
+                    (x, y),
+                    self.line_colour,
+                    self.line_width,
+                )
+            elif scale and self.flag_tool == "line" and len(self.points) > 2:
+                pass
+            cv2.imshow(self.window_name, self.canvas)
+        if event == cv2.EVENT_LBUTTONDOWN:  
+            if scale and len(self.points) == 2:
+                print("already two points selected")
+                return
+            self.coords_original = (
+                int(self.zoom_x1 + (x * self.global_fx)),
+                int(self.zoom_y1 + (y * self.global_fy)),
+            )
+            self.points.append(self.coords_original)
+            cv2.polylines(
+                self.image_copy,
+                np.array([self.points]),
+                False,
+                self.line_colour,
+                self.line_width,
+            )
+            if len(self.point_list) > 0:
+                for poly in self.point_list:
+                    cv2.polylines(
+                        self.image_copy,
+                        np.array([poly]),
+                        False,
+                        self.line_colour,
+                        self.line_width,
+                    )
+            self.canvas = self.image_copy[
+                self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+            ]
+            self.canvas = cv2.resize(
+                self.canvas,
+                (self.canvas_width, self.canvas_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            self.canvas_copy = copy.deepcopy(self.canvas)
+            cv2.imshow(self.window_name, self.canvas)
+            if scale and len(self.points) == 2:
+                print("Scale set")
+                self.scale_coords = self.points
+
+        if event == cv2.EVENT_RBUTTONDOWN:
+            if len(self.points) > 0:
+                self.points = self.points[:-1]
+                self.image_copy = copy.deepcopy(self.image)
+                cv2.polylines(
+                    self.image_copy,
+                    np.array([self.points]),
+                    False,
+                    self.line_colour,
+                    self.line_width,
+                )
+                for poly in self.point_list:
+                    cv2.polylines(
+                        self.image_copy,
+                        np.array([poly]),
+                        False,
+                        self.line_colour,
+                        self.line_width,
+                    )
+                self.canvas = self.image_copy[
+                    self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+                ]
+                self.canvas = cv2.resize(
+                    self.canvas,
+                    (self.canvas_width, self.canvas_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                self.canvas_copy = copy.deepcopy(self.canvas)
+                cv2.imshow(self.window_name, self.canvas)
+            elif len(self.points) == 0 and len(self.point_list) > 0:
+                self.point_list = self.point_list[:-1]
+                self.image_copy = copy.deepcopy(self.image)
+                for poly in self.point_list:
+                    cv2.polylines(
+                        self.image_copy,
+                        np.array([poly]),
+                        False,
+                        self.line_colour,
+                        self.line_width,
+                    )
+                self.canvas = self.image_copy[
+                    self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+                ]
+                self.canvas = cv2.resize(
+                    self.canvas,
+                    (self.canvas_width, self.canvas_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                self.canvas_copy = copy.deepcopy(self.canvas)
+                cv2.imshow(self.window_name, self.canvas)
+
+        if flags == cv2.EVENT_FLAG_CTRLKEY and len(self.points) > 2:
+            if not polyline:
+                self.points.append(self.points[0])
+            self.point_list.append(self.points)
+            self.points = []
+            self.image_copy = copy.deepcopy(self.image)
+            if len(self.point_list) > 0:
+                for poly in self.point_list:
+                    cv2.polylines(
+                        self.image_copy,
+                        np.array([poly]),
+                        False,
+                        self.line_colour,
+                        self.line_width,
+                    )
+            self.canvas = self.image_copy[
+                self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+            ]
+            self.canvas = cv2.resize(
+                self.canvas,
+                (self.canvas_width, self.canvas_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            self.canvas_copy = copy.deepcopy(self.canvas)
+
+    def _on_mouse_rectangle(self, event, x, y, flags, **kwargs):
+        ## kwargs
+        template = kwargs.get("template", False)
+        if event == cv2.EVENT_LBUTTONDOWN:  
+            if template == True and len(self.rect_list) == 1:
+                return
+            self.rect_start = x, y
+            self.canvas_copy = copy.deepcopy(self.canvas)
+            
+        if event == cv2.EVENT_LBUTTONUP:  
+            if template == True and len(self.rect_list) == 1:
+                return
+            self.rect_start = None
+            self.rect_list.append(
+                [
+                    int(self.zoom_x1 + (self.global_fx * self.rect_minpos[0])),
+                    int(self.zoom_y1 + (self.global_fy * self.rect_minpos[1])),
+                    int(self.zoom_x1 + (self.global_fx * self.rect_maxpos[0])),
+                    int(self.zoom_y1 + (self.global_fy * self.rect_maxpos[1])),
+                ]
+            )
+            for (rx1, ry1, rx2, ry2) in self.rect_list:
+                cv2.rectangle(
+                    self.image_copy,
+                    (rx1, ry1),
+                    (rx2, ry2),
+                    self.line_colour,
+                    self.line_width,
+                )
+            self.canvas = self.image_copy[
+                self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+            ]
+            self.canvas = cv2.resize(
+                self.canvas,
+                (self.canvas_width, self.canvas_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            self.canvas_copy = copy.deepcopy(self.canvas)
+            cv2.imshow(self.window_name, self.canvas)
+            if template == True and len(self.rect_list) == 1:
+                print("Template selected")
+                
+        if event == cv2.EVENT_RBUTTONDOWN:
+            if len(self.rect_list) > 0:
+                self.rect_list = self.rect_list[:-1]
+                self.image_copy = copy.deepcopy(self.image)
+                for (rx1, ry1, rx2, ry2) in self.rect_list:
+                    cv2.rectangle(
+                        self.image_copy,
+                        (rx1, ry1),
+                        (rx2, ry2),
+                        self.line_colour,
+                        self.line_width,
+                    )
+                self.canvas = self.image_copy[
+                    self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+                ]
+                self.canvas = cv2.resize(
+                    self.canvas,
+                    (self.canvas_width, self.canvas_height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                self.canvas_copy = copy.deepcopy(self.canvas)
+                cv2.imshow(self.window_name, self.canvas)
+        elif self.rect_start:
+            if flags and cv2.EVENT_FLAG_LBUTTON:  
+                self.canvas = copy.deepcopy(self.canvas_copy)
+                self.rect_minpos = min(self.rect_start[0], x), min(self.rect_start[1], y)
+                self.rect_maxpos = max(self.rect_start[0], x), max(self.rect_start[1], y)
+                cv2.rectangle(
+                    self.canvas,
+                    self.rect_minpos,
+                    self.rect_maxpos,
+                    self.line_colour,
+                    self.line_width,
+                )
+                cv2.imshow(self.window_name, self.canvas)
+                
+    def _on_mouse_draw(self, event, x, y, flags):     
+        
+        ## set colour - left/right mouse button use different colours
+        if event in [cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN]:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                self.colour_current = colours[self.colour_left]
+            elif event == cv2.EVENT_RBUTTONDOWN:
+                self.colour_current = colours[self.colour_right]
+            
+            ## start drawing and use current coords as start point
+            self.canvas = copy.deepcopy(self.canvas_copy)
+            self.ix,self.iy=x,y
+            self.coords_original_i = (
+                int(self.zoom_x1 + (self.ix * self.global_fx)),
+                int(self.zoom_y1 + (self.iy * self.global_fy)),
+            )
+            self.points.append(self.coords_original_i)
+            self.drawing=True
+
+        ## finish drawing and update image_copy
+        if event==cv2.EVENT_LBUTTONUP or event==cv2.EVENT_RBUTTONUP:
+            self.drawing=False
+            self.canvas = copy.deepcopy(self.canvas_copy)
+            self.point_list.append([
+                self.points,
+                self.colour_current, 
+                int(self.line_width*self.global_fx),
+                ])
+            self.points = []
+            
+            ## draw all segments
+            self.image_bin = copy.deepcopy(self.image_bin_copy)
+            for segment in self.point_list:
+                cv2.polylines(
+                    self.image_bin,
+                    np.array([segment[0]]),
+                    False,
+                    segment[1],
+                    segment[2],
+                    )
+                
+            ## convert binary image to colour mask
+            self._bin2colmask(self.image_copy, self.image_bin)
+
+            ## resize image and mask
+            self.canvas = self.image_copy[
+                self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+            ]
+            self.canvas = cv2.resize(
+                self.canvas,
+                (self.canvas_width, self.canvas_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            self.colour_mask = self.colour_mask[
+                self.zoom_y1 : self.zoom_y2, self.zoom_x1 : self.zoom_x2
+            ]
+            self.colour_mask = cv2.resize(
+                self.colour_mask,
+                (self.canvas_width, self.canvas_height),
+                interpolation=cv2.INTER_LINEAR,
+            )          
+            
+            ## merge mask and canvas
+            self._canvasAndColmask()
+            
+            cv2.imshow(self.window_name, self.canvas)
+                
+        ## drawing mode
+        elif self.drawing:
+            self.coords_original = (
+                int(self.zoom_x1 + (x * self.global_fx)),
+                int(self.zoom_y1 + (y * self.global_fy)),
+            )
+            self.coords_original_i = (
+                int(self.zoom_x1 + (self.ix * self.global_fx)),
+                int(self.zoom_y1 + (self.iy * self.global_fy)),
+            )
+            self.points.append(self.coords_original)
+            
+            cv2.line(self.canvas,(self.ix,self.iy),(x,y), 
+                     self.colour_current, self.line_width) 
+            self.ix,self.iy = x,y
+            cv2.imshow(self.window_name, self.canvas)  
+                        
+        if self.keypress == 9 and event == cv2.EVENT_MOUSEWHEEL:
+            if flags > 1:
+                self.line_width_orig += 1
+            if flags < 1 and self.line_width > 1:
+                self.line_width_orig -= 1
+            self.canvas = copy.deepcopy(self.canvas_copy)
+            self.line_width = int(self.line_width_orig / ((self.zoom_x2 - self.zoom_x1) / self.image_width))
+            cv2.line(self.canvas,(x,y),(x,y),colours["black"],self.line_width) 
+            cv2.line(self.canvas,(x,y),(x,y),colours["white"],max(self.line_width-5,1)) 
+            cv2.imshow(self.window_name, self.canvas)
+
+    def _zoom_fun(self, x, y):
+        """Helper function for image_viewer. Takes current xy coordinates and 
+        zooms in within a rectangle around mouse coordinates while transforming 
+        current cursor coordinates back to original coordinate space
+        """
+        if y <= 0:
+            y = 1
+        if x <= 0:
+            x = 1
+
+        x_prop, y_prop = x / self.canvas_width, y / self.canvas_height
+        left_padding, right_padding = (
+            int(round(x_prop * self.zoom_step_x)),
+            int(round((1 - x_prop) * self.zoom_step_x)),
+        )
+        top_padding, bottom_padding = (
+            int(round(y_prop * self.zoom_step_y)),
+            int(round((1 - y_prop) * self.zoom_step_y)),
+        )
+
+        if self.flag_zoom > 0:
+            x1, x2 = self.zoom_x1 + left_padding, self.zoom_x2 - right_padding
+            y1, y2 = self.zoom_y1 + top_padding, self.zoom_y2 - bottom_padding
+        if self.flag_zoom < 0:
+            x1, x2 = (
+                self.zoom_x1 - left_padding,
+                self.zoom_x2 + right_padding,
+            )
+            y1, y2 = self.zoom_y1 - top_padding, self.zoom_y2 + bottom_padding
+            if x1 < 0:
+                x2 = x2 + abs(x1)
+                x1 = 0
+            if x2 > self.image_width:
+                x1 = x1 - (x2 - self.image_width)
+                x2 = self.image_width
+            if y1 < 0:
+                y2 = y2 + abs(y1)
+                y1 = 0
+            if y2 > self.image_height:
+                y1 = y1 - (y2 - self.image_height)
+                y2 = self.image_height
+
+        ## failsafe when zooming out, sets zoom-coords to image coords
+        if self.zoom_idx == 1:
+            x1,x2,y1,y2 = 0, self.image_width, 0, self.image_height
+
+        ## zoom coords
+        self.zoom_x1, self.zoom_x2, self.zoom_y1, self.zoom_y2 = x1, x2, y1, y2
+
+        ## global magnification factor
+        self.global_fx = self.canvas_fx * (
+            (self.zoom_x2 - self.zoom_x1) / self.image_width
+        )
+        self.global_fy = self.canvas_fy * (
+            (self.zoom_y2 - self.zoom_y1) / self.image_height
+        )
+
+        ## create convas from image
+        if not self.flag_tool == "draw":
+            self.canvas = self.image_copy[y1:y2, x1:x2]
+            self.canvas = cv2.resize(
+                self.canvas,
+                (self.canvas_width, self.canvas_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            self.canvas_copy = copy.deepcopy(self.canvas)
+        elif self.flag_tool == "draw":
+            
+            self.canvas = self.image_copy[y1:y2, x1:x2]
+            self.colour_mask = self.colour_mask_copy[y1:y2, x1:x2]
+            self._canvasAndColmask()
+            self.line_width = int(self.line_width_orig / ((self.zoom_x2 - self.zoom_x1) / self.image_width))
+
+    def _bin2colmask(self, orig_image, binary_image):
+        
+        if len(binary_image.shape) > 2:
+            binary_image = cv2.cvtColor(binary_image, cv2.COLOR_BGR2GRAY)
+            
+        _ , self.contours, _ = cv2.findContours(
+            image=binary_image,
+            mode=cv2.RETR_EXTERNAL,
+            method=cv2.CHAIN_APPROX_SIMPLE,
+        )
+        
+        self.colour_mask = np.zeros_like(orig_image)
+        
+        self.colour_mask[:] = colours["red"]
+        
+        for contour in self.contours:
+            cv2.drawContours(
+                image=self.colour_mask,
+                contours=[contour],
+                contourIdx=0,
+                thickness=-1,
+                color=colours["green"],
+                maxLevel=3,
+                offset=None,
+            )
+        
+        self.colour_mask_copy = copy.deepcopy(self.colour_mask)
+        
+    def _canvasAndColmask(self):
+                
+        flag_fill = 0.3
+        self.canvas = cv2.addWeighted(self.canvas, 
+                                      1 - flag_fill, 
+                                      self.colour_mask, 
+                                      flag_fill, 
+                                      0)
+        self.canvas = cv2.resize(
+            self.canvas,
+            (self.canvas_width, self.canvas_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        self.canvas_copy = copy.deepcopy(self.canvas)
+
+
+class _yaml_file_monitor:
+    def __init__(self, filepath, delay=100):
+
+        ## file, location and event action
+        self.dirpath = os.path.dirname(filepath)
+        self.filename = os.path.basename(filepath)
+        self.filepath = filepath
+        self.event_handler = PatternMatchingEventHandler(patterns=["*/" + self.filename])
+        self.event_handler.on_any_event = self.on_update
+
+        ## intitialize
+        self.content = _load_yaml(self.filepath, typ="safe")
+        self.observer = Observer()
+        self.observer.schedule(self.event_handler, self.dirpath, recursive=False)
+        self.observer.start()
+        self.ref_time = time.time()
+        self.delay = delay
+
+    def on_update(self, event):
+        self.content = _load_yaml(self.filepath, typ="safe")
+        global global_end_while
+        global_end_while = True
+        cv2.destroyWindow("phenopype")
+        cv2.waitKey(self.delay)
+
+    def stop(self):
+        self.observer.stop()
+        self.observer.join()
+
+
+#%% functions
+
+
+def _auto_line_width(image, **kwargs):
+    factor = kwargs.get("factor", 0.001)
+    image_height, image_width = image.shape[0:2]
+    image_diagonal = (image_height + image_width) / 2
+    line_width = max(int(factor * image_diagonal), 1)
+
+    return line_width
+
+
+def _auto_point_size(image, **kwargs):
+    factor = kwargs.get("factor", 0.002)
+    image_height, image_width = image.shape[0:2]
+    image_diagonal = (image_height + image_width) / 2
+    point_size = max(int(factor * image_diagonal), 1)
+
+    return point_size
+
+
+def _auto_text_width(image, **kwargs):
+    factor = kwargs.get("factor", 0.0005)
+    image_height, image_width = image.shape[0:2]
+    image_diagonal = (image_height + image_width) / 2
+    text_width = max(int(factor * image_diagonal), 1)
+
+    return text_width
+
+
+def _auto_text_size(image, **kwargs):
+    factor = kwargs.get("factor", 0.00025)
+    image_height, image_width = image.shape[0:2]
+    image_diagonal = (image_height + image_width) / 2
+    text_size = max(int(factor * image_diagonal), 1)
+
+    return text_size
+
+
+def _contours_arr_tup(array):
+    coords_arr = array
+    coords_tup = []
+    for coord in coords_arr:
+        coords_tup.append((coord[0][0], coord[0][1]))
+    return coords_tup
+
+
+def _contours_tup_array(list_tup_list):
+    coords_arr_list = []
+    for tup_list in list_tup_list:
+        arr_list = []
+        for tup in tup_list:
+            arr = []
+            arr.append(tup[0])
+            arr.append(tup[1])
+            arr_list.append([arr])
+        coords_arr_list.append(np.array(arr_list, dtype=np.int32))
+    return coords_arr_list
+
+
+
+def _create_generic_pype_config(preset, config_name):
+    
+    if preset.__class__.__name__ == "str":
+        if hasattr(presets, preset):
+            pype_preset = _load_yaml(preset, typ="safe")
+            print("pype config generated from " + preset + ".")
+    else:
+        pype_preset = preset
+        preset = "custom"
+
+    pype_config = ('pype', 
+             [('name', config_name), 
+              ('preset', preset), 
+              ('date_created', datetime.today().strftime("%Y%m%d_%H%M%S"))])
+    
+    pype_config = [pype_config] + pype_preset
+    
+    return pype_config
+
+
+def _create_mask_bin(image, masks):
+    mask_bin = np.zeros(image.shape[0:2], np.uint8)
+    if masks.__class__.__name__ == "DataFrame":
+        for index, row in masks.iterrows():
+            coords = eval(row["coords"])
+            cv2.fillPoly(mask_bin, [np.array(coords, dtype=np.int32)], colours["white"])
+    elif masks.__class__.__name__ == "list":
+        cv2.fillPoly(mask_bin, [np.array(masks, dtype=np.int32)], colours["white"])
+    return mask_bin
+
+
+def _create_mask_bool(image, masks):
+    mask_bin = _create_mask_bin(image, masks)
+    return np.array(mask_bin, dtype=bool)
+
+
+def _decode_fourcc(cc):
+    return "".join([chr((int(cc) >> 8 * i) and 0xFF) for i in range(4)])
+
+
+def _del_rw(action, name, exc):
+    os.chmod(name, S_IWRITE)
+    os.remove(name)
+
+
+def _file_walker(
+    directory,
+    filetypes=[],
+    include=[],
+    include_all=True,
+    exclude=[],
+    raw_mode="copy",
+    search_mode="dir",
+    unique_mode="path",
+    **kwargs
+):
+    """
+    
+    Parameters
+    ----------
+    directory : str
+        path to directory to search for files
+    search_mode: {"dir", "recursive"}, str, optional
+        "dir" searches current directory for valid files; "recursive" walks through all subdirectories
+    filetypes (optional): list of str
+        single or multiple string patterns to target files with certain endings
+    include (optional): list of str
+        single or multiple string patterns to target certain files to include
+    include_all (optional): bool,
+        either all (True) or any (False) of the provided keywords have to match
+    exclude (optional): list of str
+        single or multiple string patterns to target certain files to exclude - can overrule "include"
+    unique_mode (optional): str (default: "filepath")
+        how should unique files be identified: "filepath" or "filename". "filepath" is useful, for example, 
+        if identically named files exist in different subfolders (folder structure will be collapsed and goes into the filename),
+        whereas filename will ignore all those files after their first occurrence.
+
+    Returns
+    -------
+    None.
+
+    """
+    ## kwargs
+    pype_mode = kwargs.get("pype_mode", False)
+    if not filetypes.__class__.__name__ == "list":
+        filetypes = [filetypes]
+    if not include.__class__.__name__ == "list":
+        include = [include]
+    if not exclude.__class__.__name__ == "list":
+        exclude = [exclude]
+    flag_include_all = include_all
+
+    ## find files
+    filepaths1, filepaths2, filepaths3, filepaths4 = [], [], [], []
+    if search_mode == "recursive":
+        for root, dirs, files in os.walk(directory):
+            for file in os.listdir(root):
+                filepath = os.path.join(root, file)
+                if os.path.isfile(filepath):
+                    filepaths1.append(filepath)
+    elif search_mode == "dir":
+        for file in os.listdir(directory):
+            filepath = os.path.join(directory, file)
+            if os.path.isfile(filepath):
+                filepaths1.append(filepath)
+
+    ## file endings
+    if len(filetypes) > 0:
+        for filepath in filepaths1:
+            if filepath.endswith(tuple(filetypes)):
+                filepaths2.append(filepath)
+    elif len(filetypes) == 0:
+        filepaths2 = filepaths1
+
+    ## include
+    if len(include) > 0:
+        for filepath in filepaths2:
+            if flag_include_all:
+                if all(inc in os.path.basename(filepath) for inc in include):
+                    filepaths3.append(filepath)
+            else:
+                if any(inc in os.path.basename(filepath) for inc in include):
+                    filepaths3.append(filepath)
+    else:
+        filepaths3 = filepaths2
+
+    ## exclude
+    if len(exclude) > 0:
+        for filepath in filepaths3:
+            if not any(exc in os.path.basename(filepath) for exc in exclude):
+                filepaths4.append(filepath)
+    else:
+        filepaths4 = filepaths3
+
+    ## check if files found
+    filepaths = filepaths4
+    if len(filepaths) == 0 and not pype_mode:
+        print("No files found under the given location that match given criteria.")
+        return None, None
+    
+    ## allow unique filenames filepath or by filename only
+    filenames, unique_filename, unique, duplicate = [], [], [], []
+    for filepath in filepaths:
+        filenames.append(os.path.basename(filepath))
+    if unique_mode in ["filepaths", "filepath", "path"]:
+        for filename, filepath in zip(filenames, filepaths):
+            if not filepath in unique:
+                unique.append(filepath)
+            else:
+                duplicate.append(filepath)
+    elif unique_mode in ["filenames", "filename", "name"]:
+        for filename, filepath in zip(filenames, filepaths):
+            if not filename in unique_filename:
+                unique_filename.append(filename)
+                unique.append(filepath)
+            else:
+                duplicate.append(filepath)
+
+    return unique, duplicate
+
+
+def _equalize_histogram(image, detected_rect_mask, template):
+    """Histogram equalization via interpolation, upscales the results from the detected reference card to the entire image.
+    May become a standalone function at some point in the future. THIS STRONGLY DEPENDS ON THE QUALITY OF YOUR TEMPLATE.
+    Mostly inspired by this SO question: https://stackoverflow.com/questions/32655686/histogram-matching-of-two-images-in-python-2-x
+    More theory here: https://docs.opencv.org/master/d4/d1b/tutorial_histogram_equalization.html
+    """
+    detected_ravel = detected_rect_mask.ravel()
+    template_ravel = template.ravel()
+
+    detected_counts = np.bincount(detected_ravel, minlength=256)
+    detected_quantiles = np.cumsum(detected_counts).astype(np.float64)
+    detected_quantiles /= detected_quantiles[-1]
+
+    template_values = np.arange(0, 256, 1, dtype=np.uint8)
+    template_counts = np.bincount(template_ravel, minlength=256)
+    template_quantiles = np.cumsum(template_counts).astype(np.float64)
+    template_quantiles /= template_quantiles[-1]
+
+    interp_template_values = np.interp(
+        detected_quantiles, template_quantiles, template_values
+    )
+    interp_template_values = interp_template_values.astype(image.dtype)
+
+    return interp_template_values[image]
+
+
+
+def _load_pype_config(obj_input, **kwargs):
+
+    ## kwargs
+    config_name = kwargs.get("config_name", default_pype_config_name)
+    preset = kwargs.get("preset")
+    
+    if preset.__class__.__name__ == "NoneType":
+        preset = default_pype_config
+
+    ## load config location
+    if obj_input.__class__.__name__ == "str":
+        config_location = obj_input
+        if os.path.isfile(config_location):
+            return _load_yaml(config_location, typ="safe"), config_location
+    elif obj_input.__class__.__name__ == "container":
+        dirpath = obj_input.dirpath
+        config_location = os.path.join(dirpath, "pype_config_" + config_name + ".yaml")
+
+    ## check if exists, otherwise ask to create
+    if os.path.isfile(config_location):
+        return _load_yaml(config_location, typ="safe"), config_location
+    elif not os.path.isfile(config_location):
+        create = input(
+            'Did not find "pype_config_'
+            + config_name
+            + '.yaml" - '
+            + " create at following location? (y/n):\n"
+            + config_location
+            + "\n"
+        )
+        if create == "y" or create == "yes":
+            pype_preset = _create_generic_pype_config(preset, config_name)           
+            image_data = [(k,v) for k, v in copy.deepcopy(obj_input.image_data).items()]            
+            config = [("image", image_data)]
+            config = config + pype_preset
+            print(
+                'Created and saved new pype config "'
+                + os.path.basename(config_location)
+                + '" in folder '
+                + os.path.dirname(config_location)
+            )
+            _save_yaml(config, config_location, typ="safe")
+            return pype_preset, config_location
+        else:
+            sys.exit('Did not find "pype_config_' + config_name + '.yaml" - abort.')
+    else:
+        sys.exit('Did not find "pype_config_' + config_name + '.yaml" - abort.')
+
+
+def _show_yaml(config, ret=False, typ="rt"):
+    
+    ## has to be "safe" for pype
+    flag_type = typ
+    
+    if flag_type == "safe":
+        print("Cannot print yaml in safe-mode")
+    
+    else:
+        yaml = YAML(typ=typ)
+        if ret:
+            with io.StringIO() as buf, redirect_stdout(buf):
+                yaml.dump(config, sys.stdout)
+                return buf.getvalue()
+        else:
+            yaml.dump(config, sys.stdout)
+        
+
+
+def _load_yaml(string, typ="rt"):
+    
+    ## has to be "safe" for pype      
+    yaml = YAML(typ=typ)
+    
+    if string.__class__.__name__ == "str":
+        if os.path.isfile(string):
+            with open(string, "r") as file:
+                config = yaml.load(file)
+            return config
+        elif hasattr(presets, string):
+            config = yaml.load(eval("presets." + string))
+            return config
+        else:
+            print("Not a valid filepath - couldn't load yaml.")
+            return
+    else:
+        print("Wrong input - couldn't load yaml.")
+        return
+
+
+
+def _save_yaml(config, filepath, typ="rt"):
+
+    ## has to be "safe" for pype
+    yaml =  YAML(typ=typ)
+        
+    ## save
+    if typ=="safe":
+        with open(filepath, "w") as config_file:
+
+            ## go throgh steps (top-level; including "image" / "pype")
+            for step in config:           
+                step_name = step[0]
+                step_method_list = step[1]
+                # print(step_name)
+                config_file.write(step_name + ":\n")
+                
+                ## go through methods (second-level)
+                if not step_method_list.__class__.__name__ == "NoneType":
+                    for method in step_method_list:
+                                            
+                        ## methods without arguments
+                        if method.__class__.__name__ == "str":
+                            method_name = method
+                            config_file.write("- " + str(method_name) + "\n")
+                            
+                        ## methods with arguments
+                        elif method.__class__.__name__ == "list":
+                            method_name = method[0][0]
+                            if method[0][1].__class__.__name__ == "NoneType":
+                                method_arguments = {}
+                            else:
+                                method_arguments = dict(method[0][1])   
+                            config_file.write("- " + method_name + ":\n")
+                            for key, value in method_arguments.items():
+                                config_file.write("    " + key + ": " + str(value) + "\n")
+                                
+                        ## meta-data ("image" / "pype")
+                        elif method.__class__.__name__ == "tuple":
+                            method_name = method[0]
+                            method_arguments = method[1]         
+                            if method_name == "date_created":
+                                method_arguments = str(method_arguments)
+                                method_arguments = method_arguments[0:8] + "_" + method_arguments[8:16]
+                            config_file.write("  " + str(method_name) + ": " + str(method_arguments) + "\n")  
+
+    else:
+        with open(filepath, "w") as config_file:
+            yaml.dump(config, config_file)
+
+
+def _timestamp():
+    return datetime.today().strftime("%Y:%m:%d %H:%M:%S")
+
+
+# def get_median_grayscale(image, **kwargs):
+#     if (image.shape[0] + image.shape[1])/2 > 2000:
+#         factor = kwargs.get('resize', 0.5)
+#         image = cv2.resize(image, (0,0), fx=1*factor, fy=1*factor)
+
+#     vector = np.ravel(image)
+#     vector_mc = Counter(vector).most_common(9)
+#     g = [item[0] for item in vector_mc]
+#     return int(np.median(g))
+
+# def avgit(x):
+#     return x.sum(axis=0)/np.shape(x)[0]
+
+# def decode_fourcc(cc):
+#     return "".join([chr((int(cc) >> 8 * i) and 0xFF) for i in range(4)])
