@@ -1,0 +1,207 @@
+"""
+Lifecycle
+=========
+
+Defines a lifecycle of tasks in RKD scheduler.
+
+-> compile: When all of the contexts are compiled, then manipulate the list of tasks
+-> configure: After task was scheduled to execute (we know this task will be executed)
+-> shutdown: After all tasks have been executed
+
+Each lifecycle event emits a separate event for each task. Events are immutable, cannot be manipulated by task -
+only allowed methods can be executed.
+"""
+
+from inspect import getsource
+from copy import copy
+from textwrap import dedent
+from typing import Dict, Union, List
+from rkd.core.api.contract import TaskInterface
+from rkd.core.api.lifecycle import CompilationLifecycleEventAware, ConfigurationLifecycleEventAware
+from rkd.core.api.inputoutput import IO
+from rkd.core.api.syntax import TaskDeclaration, GroupDeclaration
+from rkd.core.exception import LifecycleConfigurationException, HandledExitException
+
+
+class CompilationLifecycleEvent(object):
+    """
+    When all of the contexts are compiled, then give possibility to manipulate the list of tasks
+    EXECUTES FOR ALL TASKS that are implementing CompilationLifecycleEventAware interface
+
+    Context = single makefile (a build file)
+    """
+
+    __slots__ = ['_current_task', '_compiled', 'io']
+    _current_task: TaskDeclaration
+    _compiled: Dict[str, Union[TaskDeclaration, GroupDeclaration]]
+    io: IO
+
+    def __init__(self, current_task: TaskDeclaration, compiled: Dict[str, Union[TaskDeclaration, GroupDeclaration]], io: IO):
+        self._current_task = current_task
+        self._compiled = compiled
+        self.io = io
+
+    def get_current_declaration(self) -> TaskDeclaration:
+        return self._current_task
+
+    def expand_into_group(self, tasks: List[TaskDeclaration], pipeline: bool = True,
+                          source_first: bool = False, source_last: bool = False,
+                          rename_to: str = ':exec-group') -> None:
+        """
+        Make a single task to expand itself into a group of tasks
+
+        Input: List of tasks
+        Result: All tasks added to the context + when original task is executed then all put tasks are executed
+
+        :param:pipeline should the grouped task be added as a pipeline?
+        :param:source_first Add source task at beginning of pipeline
+        :param:source_last Add source task at end of pipeline
+        """
+
+        # be sure that old task is no longer there
+        del self._compiled[self._current_task.to_full_name()]
+
+        # rename original task, make internal
+        renamed = self._current_task.with_new_name(
+                task_name=':' + self._current_task.get_task_name() + rename_to,
+                group_name=self._current_task.get_group_name()) \
+            .as_internal_task()
+
+        # renamed internal task
+        self._compiled[renamed.to_full_name()] = renamed
+
+        # add our group (a pipeline)
+        if pipeline:
+            if source_first:
+                tasks = [renamed] + tasks
+
+            if source_last:
+                tasks.append(renamed)
+
+            group = GroupDeclaration(
+                name=self._current_task.to_full_name(),
+                declarations=tasks,
+                description=self._current_task.get_description()
+            )
+            self._compiled[group.to_full_name()] = group
+
+        # add tasks that are part of the pipeline
+        for task in tasks:
+            self._compiled[task.to_full_name()] = task
+
+    @staticmethod
+    def run_event(io: IO, compiled: Dict[str, Union[TaskDeclaration, GroupDeclaration]]):
+        io.internal('Running AfterCompileLifecycleEvent on all tasks')
+
+        for name, declaration in copy(compiled).items():
+            io.internal(f'compile({declaration})')
+
+            if not isinstance(declaration, TaskDeclaration):
+                io.internal('compilation skipped, not a TaskDeclaration')
+                continue
+
+            if not isinstance(declaration.get_task_to_execute(), CompilationLifecycleEventAware):
+                io.internal('compilation skipped, task does not implement CompilationLifecycleEventAware')
+                continue
+
+            task: Union[CompilationLifecycleEventAware, TaskInterface] = declaration.get_task_to_execute()
+            task.compile(CompilationLifecycleEvent(declaration, compiled, io))
+
+
+class ConfigurationLifecycleEvent(object):
+    pass
+
+
+class LimitedScopeTaskProxy(object):
+    """
+    Proxy used to limit operations scope
+    """
+
+    __task: TaskInterface
+    __declaration: TaskDeclaration
+    __allowed: List[str]
+
+    def __init__(self, task: TaskInterface, declaration: TaskDeclaration, allowed: List[str]):
+        self.__task = task
+        self.__declaration = declaration
+        self.__allowed = allowed
+
+    def __getattr__(self, name: str):
+        if self.__allowed and name not in self.__allowed:
+            raise LifecycleConfigurationException.from_invalid_method_used(
+                task_full_name=self.__declaration.to_full_name(),
+                method_name=name
+            )
+
+        return self.__task.__getattribute__(name)
+
+
+class ConfigurationResolver(object):
+    """
+    Goes through task-by-task and calls configure() ONLY WHEN method implements ConfigurationLifecycleEventAware
+    interface.
+
+    NOTICE: Each configure() method gets LimitedScopeTaskProxy() instance as self to limit scope of what can be done
+    """
+
+    io: IO
+
+    def __init__(self, io: IO):
+        self.io = io
+
+    def run_event(self, declaration: TaskDeclaration, task_num: int, parent: Union[GroupDeclaration, None] = None,
+                  args: list = None):
+
+        if not isinstance(declaration, TaskDeclaration):
+            self.io.internal('configuration skipped, not a TaskDeclaration')
+            return
+
+        if not isinstance(declaration.get_task_to_execute(), ConfigurationLifecycleEventAware):
+            self.io.internal('configuration skipped, task does not implement ConfigurationLifecycleEventAware')
+            return
+
+        self.io.internal(f'configuring {declaration}')
+
+        # create a proxy method that will reduce the scope of what can be done in configure() stage
+        task: Union[ConfigurationLifecycleEventAware, TaskInterface] = declaration.get_task_to_execute()
+        task.__setattr__('configure',
+                         self.create_proxy_method(
+                             task,
+                             LimitedScopeTaskProxy(
+                                 task=task,
+                                 allowed=task.get_configuration_attributes(),
+                                 declaration=declaration
+                             )))
+
+        # call configuration
+        try:
+            task.configure(ConfigurationLifecycleEvent())
+
+        except Exception as err:
+            self.io.error_msg(str(err))
+            self.io.error_msg(f'Task "{declaration}" cannot be configured')
+
+            raise HandledExitException() from err
+
+    @classmethod
+    def create_proxy_method(cls, task: ConfigurationLifecycleEventAware, scope: LimitedScopeTaskProxy):
+        """
+        Creates proxy method that will replace `configure()` inside TaskInterface (only for one instance, not for class)
+        Purpose:
+
+        :param task:
+        :param scope:
+        :return:
+        """
+
+        source_code_lines = getsource(task.configure).split("\n")
+        del source_code_lines[0]
+        source_code = "# source code generated by proxy method\n" + dedent("\n".join(source_code_lines))
+
+        # signature: def configure (self, event: ConfigurationLifecycleEvent)
+        def _configure_proxy_method(event: ConfigurationLifecycleEvent):
+            self = scope
+
+            return exec(source_code)
+
+        return _configure_proxy_method
