@@ -1,0 +1,1 @@
+from storecompressfiles.class1 import encode,decode
