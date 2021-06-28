@@ -1,0 +1,2 @@
+class CGX(object):
+    pass
