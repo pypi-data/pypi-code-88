@@ -1,0 +1,2 @@
+class PMakeupException(Exception):
+    pass
