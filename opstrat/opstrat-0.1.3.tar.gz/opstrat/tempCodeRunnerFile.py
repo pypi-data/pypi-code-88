@@ -1,0 +1,1 @@
+print(black_scholes(type='p'))
