@@ -1,0 +1,28 @@
+# This script contain implentation of operators.
+# Author:
+#     Albert Dongz
+# History:
+#     2020.7.16 First Release
+# Dependencies:
+#     PyTorch
+# Attention:
+#     1. Nothing
+import torch.nn as nn
+from .quant_base import QuantBase
+
+#! Deprecated
+#! Dropout layer do not change activation locally
+
+# class QuantDropout(QuantBase):
+#     def __init__(self, name, module, bit_width, writer):
+#         super().__init__(name, module, bit_width,  writer)
+#         self.activation_positive = False
+
+#     def quantize_params(self):
+#         pass
+
+dropout_switch = {
+    # nn.Dropout: QuantDropout,
+    # nn.Dropout2d: QuantDropout,
+    # nn.Dropout3d: QuantDropout,
+}
