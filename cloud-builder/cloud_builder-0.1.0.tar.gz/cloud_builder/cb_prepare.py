@@ -1,0 +1,141 @@
+# Copyright (c) 2021 Marcus Schaefer.  All rights reserved.
+#
+# This file is part of Cloud Builder.
+#
+# Cloud Builder is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Cloud Builder is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Cloud Builder.  If not, see <http://www.gnu.org/licenses/>
+#
+"""
+usage: cb-prepare -h | --help
+       cb-prepare --root=<root_path> --package=<package_path>
+           [--config=<file>]
+
+options:
+    --root=<root_path>
+        Base path to create chroot(s) for later cb_run
+
+    --package=<package_path>
+        Path to the package
+
+    --config=<file>
+        Package config file. Contains specifications how to
+        build the package and for which targets. By default
+        cloud_builder.yml from the package directory is used
+"""
+import os
+from docopt import docopt
+from textwrap import dedent
+from cloud_builder.version import __version__
+from cloud_builder.cloud_logger import CBCloudLogger
+from cloud_builder.exceptions import exception_handler
+from cloud_builder.defaults import Defaults
+from kiwi.utils.sync import DataSync
+from kiwi.privileges import Privileges
+from kiwi.path import Path
+from typing import Dict
+
+
+@exception_handler
+def main() -> None:
+    args = docopt(
+        __doc__,
+        version='CB (prepare) version ' + __version__,
+        options_first=True
+    )
+
+    Privileges.check_for_root_permissions()
+
+    log = CBCloudLogger('CBPrepare', os.path.basename(args['--package']))
+
+    status_flags = Defaults.get_status_flags()
+
+    package_config = Defaults.get_package_config(
+        args['--package'], args['--config']
+    )
+    target_root_dict: Dict = {
+        'target_roots': []
+    }
+    for target in package_config.get('dists') or []:
+        target_root = os.path.normpath(
+            os.sep.join(
+                [args["--root"], f'{package_config["name"]}@{target}']
+            )
+        )
+        prepare_log_file = f'{target_root}.prepare.log'
+        log.info(
+            'Creating buildroot {0}. For details see: {1}'.format(
+                target_root, prepare_log_file
+            )
+        )
+        kiwi_run = [
+            Path.which(
+                'kiwi-ng', alternative_lookup_paths=['/usr/local/bin']
+            ), '--logfile', prepare_log_file, '--profile', target,
+            'system', 'prepare', '--description', args['--package'],
+            '--allow-existing-root', '--root', target_root
+        ]
+        return_value = os.system(
+            ' '.join(kiwi_run)
+        )
+        exit_code = return_value >> 8
+        if exit_code != 0:
+            status = status_flags.buildroot_setup_failed
+            message = 'Failed in kiwi stage, see logfile for details'
+        else:
+            try:
+                data = DataSync(
+                    f'{args["--package"]}/',
+                    f'{target_root}/{package_config["name"]}/'
+                )
+                data.sync_data(
+                    options=['-a', '-x']
+                )
+                target_root_dict['target_roots'].append(
+                    target_root
+                )
+                run_script = dedent('''
+                    #!/bin/bash
+
+                    set -e
+
+                    function finish {{
+                        for path in /proc /dev;do
+                            mountpoint -q "$path" && umount "$path"
+                        done
+                    }}
+
+                    trap finish EXIT
+
+                    mount -t proc proc /proc
+                    mount -t devtmpfs devtmpfs /dev
+
+                    pushd {0}
+                    build --no-init --root /
+                ''')
+                with open(f'{target_root}/run.sh', 'w') as script:
+                    script.write(
+                        run_script.format(package_config['name'])
+                    )
+                status = status_flags.buildroot_setup_succeeded
+                message = 'Buildroot ready for package build'
+            except Exception as issue:
+                status = status_flags.buildroot_setup_failed
+                message = format(issue)
+        log.response(
+            {
+                'identity': log.get_id(),
+                'message': message,
+                'status': status,
+                'preparelog': prepare_log_file
+            }
+        )
