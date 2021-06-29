@@ -1,0 +1,1 @@
+from faina_semenovna.faina import FainaSemenovna
